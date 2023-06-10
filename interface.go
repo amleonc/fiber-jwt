@@ -1,9 +1,15 @@
 package fiber_jwt
 
 import (
+	"errors"
+	"log"
+	"reflect"
+	"strings"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/lestrrat-go/option"
 )
 
@@ -11,7 +17,7 @@ type Option = option.Interface
 
 type SignatureAlgorithm = jwa.SignatureAlgorithm
 
-type Extractor = func(*fiber.Ctx) string
+type Extractor func(*fiber.Ctx) string
 
 type JWT struct {
 	// Filter defines an optional function to skip the middleware
@@ -23,12 +29,12 @@ type JWT struct {
 	// ErrorHandler is called when an error occurred during
 	// the token verification.
 	ErrorHandler fiber.ErrorHandler
+	// authenticator is the function to send http responses,
+	// depending on the result of the token validation.
+	authenticator fiber.Handler
 	// userCtxKey is the key in the context which will hold the
 	// user information. Default: "user".
 	userCtxKey string
-	// userInfo is a map holding info extracted from the token
-	// regarding user information.
-	userInfo map[string]any
 	// alg the algorithm of the key model. Default: HS256.
 	alg SignatureAlgorithm
 	// signKey the object used to sign tokens.
@@ -49,15 +55,41 @@ type JWT struct {
 	authScheme string
 	// extractors the functions used to extract tokens from the http request.
 	extractors []Extractor
-	verifier   jwk.Key
+	verifier   jwt.ParseOption
 }
 
-var defaultJWT = &JWT{
-	Filter:     nil,
-	userCtxKey: "user",
-	userInfo:   nil,
-	alg:        "HS256",
-	extractors: []Extractor{FromCookie},
+const (
+	ES256  SignatureAlgorithm = "ES256"  // ECDSA using P-256 and SHA-256
+	ES256K SignatureAlgorithm = "ES256K" // ECDSA using secp256k1 and SHA-256
+	ES384  SignatureAlgorithm = "ES384"  // ECDSA using P-384 and SHA-384
+	ES512  SignatureAlgorithm = "ES512"  // ECDSA using P-521 and SHA-512
+	EdDSA  SignatureAlgorithm = "EdDSA"  // EdDSA signature algorithms
+	HS256  SignatureAlgorithm = "HS256"  // HMAC using SHA-256
+	HS384  SignatureAlgorithm = "HS384"  // HMAC using SHA-384
+	HS512  SignatureAlgorithm = "HS512"  // HMAC using SHA-512
+	PS256  SignatureAlgorithm = "PS256"  // RSASSA-PSS using SHA256 and MGF1-SHA256
+	PS384  SignatureAlgorithm = "PS384"  // RSASSA-PSS using SHA384 and MGF1-SHA384
+	PS512  SignatureAlgorithm = "PS512"  // RSASSA-PSS using SHA512 and MGF1-SHA512
+	RS256  SignatureAlgorithm = "RS256"  // RSASSA-PKCS-v1.5 using SHA-256
+	RS384  SignatureAlgorithm = "RS384"  // RSASSA-PKCS-v1.5 using SHA-384
+	RS512  SignatureAlgorithm = "RS512"  // RSASSA-PKCS-v1.5 using SHA-512
+)
+
+var defaultJWT = JWT{
+	Filter: nil,
+	SuccessHandler: func(ctx *fiber.Ctx) error {
+		return ctx.Next()
+	},
+	ErrorHandler: func(ctx *fiber.Ctx, err error) error {
+		if jwt.IsValidationError(err) {
+			return ctx.Status(fiber.StatusUnauthorized).SendString("Invalid or expired JWT")
+		}
+		return ctx.Status(fiber.StatusBadRequest).SendString("Missing or malformed JWT")
+	},
+	userCtxKey:  "user",
+	alg:         "HS256",
+	tokenLookup: "cookie:jwt",
+	authScheme:  "Bearer",
 }
 
 type JWTOption interface {
@@ -74,11 +106,10 @@ func (i *identConstraintStruct) jwtConstraintMethod() {}
 type identWithNextFunc struct{}
 type identWithAlgorithm struct{}
 type identWithUserCtxKey struct{}
-type identWithUserInfo struct{}
 type identWithSignKey struct{}
 type identWithVerifyKey struct{}
 type identWithKeySet struct{}
-type identWithExtractors struct{}
+type identWithTokenLookup struct{}
 
 func WithNextFunc(f func(*fiber.Ctx) bool) JWTOption {
 	return &identConstraintStruct{option.New(identWithNextFunc{}, f)}
@@ -92,49 +123,114 @@ func WithUserCtxKey(key string) JWTOption {
 	return &identConstraintStruct{option.New(identWithUserCtxKey{}, key)}
 }
 
-func WithUserInfo(info map[string]any) JWTOption {
-	return &identConstraintStruct{option.New(identWithUserInfo{}, info)}
-}
-
 func WithSignKey(key any) JWTOption {
-	// FIXME: parse the key using the jwk package
-	return &identConstraintStruct{option.New(identWithSignKey{}, key)}
+	k, err := jwk.FromRaw(key)
+	if err != nil {
+		t := reflect.TypeOf(k)
+		log.Fatalf("invalid signing key of type `%s`, expected RSA, ECDSA or byte array\n", t)
+	}
+	return &identConstraintStruct{option.New(identWithSignKey{}, k)}
 }
 
 func WithVerifyKey(key any) JWTOption {
-	// FIXME: parse the key using the jwk package
-	return &identConstraintStruct{option.New(identWithVerifyKey{}, key)}
+	k, err := jwk.FromRaw(key)
+	if err != nil {
+		t := reflect.TypeOf(k)
+		log.Fatalf("invalid verifying key of type `%s`, expected RSA, ECDSA or byte array\n", t)
+	}
+	return &identConstraintStruct{option.New(identWithVerifyKey{}, k)}
 }
 
-func WithExtractors(fn ...Extractor) JWTOption {
-	return &identConstraintStruct{option.New(identWithExtractors{}, fn)}
-}
+// func WithKeySet(set jwk.Set) JWTOption {
+// 	return &identConstraintStruct{option.New(identWithKeySet{}, set)}
+// }
 
-func WithKeySet(set jwk.Set) JWTOption {
-	return &identConstraintStruct{option.New(identWithKeySet{}, set)}
+func WithTokenLookup(schema string) JWTOption {
+	return &identConstraintStruct{option.New(identWithTokenLookup{}, schema)}
 }
 
 func New(options ...JWTOption) JWT {
-	jwt := JWT{}
-	for _, option := range options {
-		switch option.Ident() {
+	j := defaultJWT
+	for _, o := range options {
+		switch o.Ident() {
 		case identWithNextFunc{}:
-			jwt.Filter = option.Value().(func(*fiber.Ctx) bool)
+			j.Filter = o.Value().(func(*fiber.Ctx) bool)
 		case identWithAlgorithm{}:
-			jwt.alg = option.Value().(SignatureAlgorithm)
+			j.alg = o.Value().(SignatureAlgorithm)
 		case identWithUserCtxKey{}:
-			jwt.userCtxKey = option.Value().(string)
-		case identWithUserInfo{}:
-			jwt.userInfo = option.Value().(map[string]any)
+			j.userCtxKey = o.Value().(string)
 		case identWithSignKey{}:
-			jwt.signKey = option.Value().(jwk.Key)
+			j.signKey = o.Value().(jwk.Key)
 		case identWithVerifyKey{}:
-			jwt.verifyKey = option.Value().(jwk.Key)
+			j.verifyKey = o.Value().(jwk.Key)
 		case identWithKeySet{}:
-			jwt.keySet = option.Value().(jwk.Set)
-		case identWithExtractors{}:
-			jwt.extractors = option.Value().([]Extractor)
+			j.keySet = o.Value().(jwk.Set)
 		}
 	}
-	return jwt
+	lookups := strings.Split(j.tokenLookup, ",")
+	for _, lookup := range lookups {
+		parts := strings.Split(lookup, ":")
+		switch parts[0] {
+		case "cookie":
+			j.extractors = append(j.extractors, fromCookie(parts[1]))
+		case "header":
+			j.extractors = append(j.extractors, fromHeader(parts[1], j.authScheme))
+		}
+	}
+	if len(j.extractors) == 0 {
+		panic("empty extractors, please check your token lookup schema")
+	}
+	return j
+}
+
+var (
+	ErrMissingJWT     = errors.New("missing jwt")
+	ErrInvalidPayload = errors.New("cannot map claims")
+)
+
+func (j *JWT) Serve() fiber.Handler {
+	return func(ctx *fiber.Ctx) error {
+		if j.Filter != nil && j.Filter(ctx) {
+			return ctx.Next()
+		}
+		t, err := verifyRequest(j, ctx)
+		if err != nil {
+			return j.ErrorHandler(ctx, err)
+		}
+		claims, err := t.AsMap(ctx.UserContext())
+		if err != nil {
+			return ErrInvalidPayload
+		}
+		for k, v := range claims {
+			ctx.Locals(k, v)
+		}
+		return j.SuccessHandler(ctx)
+	}
+}
+
+func verifyRequest(j *JWT, ctx *fiber.Ctx) (jwt.Token, error) {
+	var ts string
+	for _, fn := range j.extractors {
+		ts = fn(ctx)
+		if ts != "" {
+			break
+		}
+		return nil, ErrMissingJWT
+	}
+	// NOTE: is this validation really necessary?
+	if ts == "" {
+		return nil, ErrMissingJWT
+	}
+	return verifyToken(j, ts)
+}
+
+func verifyToken(j *JWT, tokenString string) (jwt.Token, error) {
+	token := jwt.New()
+	var options []jwt.ParseOption
+	options = append(options, jwt.WithToken(token), j.verifier, jwt.WithValidate(false))
+	_, err := jwt.ParseString(tokenString, options...)
+	if err != nil {
+		return nil, err
+	}
+	return token, nil
 }
