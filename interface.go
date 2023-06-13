@@ -215,7 +215,6 @@ func verifyRequest(j *JWT, ctx *fiber.Ctx) (jwt.Token, error) {
 		if ts != "" {
 			break
 		}
-		return nil, ErrMissingJWT
 	}
 	// NOTE: is this validation really necessary?
 	if ts == "" {
